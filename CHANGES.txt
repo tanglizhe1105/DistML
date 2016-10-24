@@ -1,0 +1,28 @@
+[2016-01-18]
+1. Reimplemented data transfer with pure socket
+
+[2016-01-08]
+1. Implemented LightLDA and MLR, now LR/LightLDA/MLR all works fine
+2. Add api support for Double Array/Matrix and Int Array/Matrix 
+3. Add scala api for DoubleArray
+
+[2015-12-14]
+1. Simplify APIs, allow users to use naive data for customized algorithms
+2. With API change, only LR and LDA are remained to proove API is working well
+3. Run examples on yarn and can use spark submit
+
+[2015-10-15]
+1. Add environment variable "PS_NETWORK_PREFIX", which is used by parameter servers
+2. Fix issue in handling messages after iteration done 
+
+[2015-10-12]
+1. Add serialization support for CNN classes
+
+[2015-08-21]
+1. add draft lda support
+2. support iterative UDF in serverside
+
+[2015-07-01]
+1. removed feature of worker group to reduce code complexity, a new branch "workergrou" is created
+2. use akka-io for data transport, which allows big data block transferring
+3. start parameter servers in a separated thread, allows iterative training without resparting parameter servers
