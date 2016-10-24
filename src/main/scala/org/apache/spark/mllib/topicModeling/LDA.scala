@@ -18,6 +18,8 @@
 package org.apache.spark.mllib.topicModeling
 
 import com.intel.distml.api.Model
+import com.intel.distml.platform.DistML
+import com.intel.distml.util.DataStore
 import org.apache.spark.annotation.Experimental
 import org.apache.spark.api.java.JavaPairRDD
 import org.apache.spark.mllib.linalg.Vector
@@ -252,7 +254,8 @@ class LDA private (
    *                   Document IDs must be unique and >= 0.
    * @return  Inferred LDA model
    */
-  def run(m : Model, monitorPath : String)(sc: SparkContext, documents: RDD[(Long, Vector)]): LDAModel = {
+  def run(m : Model, dm: DistML[scala.Iterator[(Int, String, DataStore)]], monitorPath : String)
+         (sc: SparkContext, documents: RDD[(Long, Vector)]): LDAModel = {
     val state = ldaOptimizer.asInstanceOf[OnlineLDAOptimizer].initialize(m, monitorPath)(sc, this)
     var windowCount = 0
     while ((windowCount +1)*windowSize < corpusSize){
@@ -269,12 +272,18 @@ class LDA private (
         logInfo(s"[windowcount+iter+maxiter: $windowCount $iter $maxIterations]")
         val start = System.nanoTime()
         val gammaArray = state.next(m, monitorPath)(batch)
+        gammaArray.cache()
+        gammaArray.count()
         val elapsedSeconds = (System.nanoTime() - start) / 1e9
         iterationTimes(iter) = elapsedSeconds
 
-        val perplexity = state.perplexity(m, monitorPath)(batch, gammaArray)
-        iterationPer(iter) = perplexity
+        val docPerplexity = state.docPerplexity(m, monitorPath, batch, gammaArray)
+        val topicPerplexity = state.topicPerplexity(m, monitorPath)
+        iterationPer(iter) = (docPerplexity, topicPerplexity)
         iter += 1
+
+        gammaArray.unpersist()
+        dm.iterationDone()
       }
       logInfo(s"[windowcount+itertime: $windowCount ${iterationTimes.mkString(" ")}]")
       logInfo(s"[windowcount+iterper: $windowCount ${iterationPer.mkString(" ")}]")

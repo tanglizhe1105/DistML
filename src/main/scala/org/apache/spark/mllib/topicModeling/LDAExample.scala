@@ -200,11 +200,11 @@ object LDAExample {
     val m = new OnlineLDAPSModel(lda.getVocabSize, lda.getK, lda.getAlpha, lda.getBeta)
     val dm = DistML.distribute(sc, m, lda.getPsCount, DistML.defaultF)
     val monitorPath = dm.monitorPath
-    println("dataset size: " + lda.getWindowSize)
-    dm.setTrainSetSize(lda.getWindowSize)
+    println("dataset size: " + lda.getCorpusSize)
+    dm.setTrainSetSize(lda.getCorpusSize)
 
     val startTime = System.nanoTime()
-    val ldaModel = lda.run(m, monitorPath)(sc, docs)
+    val ldaModel = lda.run(m, dm, monitorPath)(sc, docs)
     val elapsed = (System.nanoTime() - startTime) / 1e9
 
     println(s"Finished training LDA model using ${lda.getOptimizer.getClass.getName}")

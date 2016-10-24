@@ -41,6 +41,7 @@ object OnlineLDAOptimizer {
 final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
   // LDA common parameters
   private var k: Int = 0
+  private var corpusSize: Long = 0
   private var windowSize: Int = 0
   // model equally document size
   private var partitionSize: Int = 0
@@ -160,6 +161,7 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
   }
 
   def initialize(m : Model, monitorPath : String)(sc: SparkContext, lda: LDA): this.type = {
+    this.corpusSize = lda.getCorpusSize
     this.windowSize = lda.getWindowSize
     this.partitionSize = lda.getPartition
     this.vocabSize = lda.getVocabSize
@@ -209,8 +211,7 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
     if (batch.isEmpty()) return null
     iteration += 1
 
-    val doctopic = batch.mapPartitionsWithIndex(inference(m, monitorPath))
-    doctopic
+    batch.mapPartitionsWithIndex(inference(m, monitorPath))
   }
 
   def inference(m : Model, monitorPath : String)(index: Int, it: Iterator[(Long, Vector)]): Iterator[(Long, BDV[Double])] = {
@@ -307,7 +308,7 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
 
     // compute new lambda and delta lambda
     val partitionResult = stat :* expElogbeta
-    val lambdap = partitionResult * (windowSize.toDouble / partitionSize.toDouble) + eta
+    val lambdap = partitionResult * (corpusSize.toDouble / partitionSize.toDouble) + eta
     lambdap :-= lambda // delta lambda
     val weight = math.pow(getTau0 + iteration, -getKappa)
     lambdap :*= weight
@@ -340,7 +341,7 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
 
     // Update lambda based on documents.
     lambda = lambda * (1 - weight) +
-      (stat * (windowSize.toDouble / batchSize.toDouble) + eta) * weight
+      (stat * (corpusSize.toDouble / batchSize.toDouble) + eta) * weight
   }
 
   /**
@@ -354,10 +355,8 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
     new BDM[Double](col, row, temp).t
   }
 
-  def perplexity(m : Model, monitorPath : String)(docs: RDD[(Long, Vector)], gammaArray: RDD[(Long, BDV[Double])]): (Double, Double) = {
-    val alphaVector = Vectors.dense(Array.fill(k)(alpha))
-    val brzAlpha = alphaVector.toBreeze.toDenseVector
-
+  def topicPerplexity(m : Model, monitorPath : String): Double = {
+    var topicScore = 0D
     var start = System.currentTimeMillis()
     var end = start
     // get word topic from ps in this partition
@@ -371,7 +370,6 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
     end = System.currentTimeMillis()
     println(s"[model train fetch , partition 0 time ${end - start} ms]")
     start = end
-    session.disconnect()
 
     for (i <- 0 until vocabSize) {
       val topic = wt.get(i) match {
@@ -383,16 +381,59 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
 
     val Elogbeta = OnlineLDAOptimizer.dirichletExpectation(lambda)
 
-    // val gammaArray = inference(docs)
+    // E[log p(beta | eta) - log q (beta | lambda)]; assumes eta is a scalar
+    val sumEta = eta * vocabSize
+    topicScore += sum((eta - lambda) :* Elogbeta)
+    topicScore += sum(lgamma(lambda) - lgamma(eta))
+    topicScore += sum(lgamma(sumEta) - lgamma(sum(lambda(::, breeze.linalg.*))))
 
-    val docScore = docs.join(gammaArray).map { case (id: Long, (termCounts: Vector, gammad: BDV[Double])) =>
-      var docScore = 0.0D
+    session.disconnect()
+
+    topicScore
+  }
+
+  def docPerplexity(m : Model, monitorPath : String, docs: RDD[(Long, Vector)], gammaArray: RDD[(Long, BDV[Double])]): Double = {
+    val docScore = docs.join(gammaArray).mapPartitionsWithIndex(docPerplexity(m, monitorPath)).sum()
+    docScore
+  }
+
+  def docPerplexity(m : Model, monitorPath: String)(index: Int, it: Iterator[(Long, (Vector, BDV[Double]))])
+  : Iterator[Double] = {
+    val docgammas = it.toArray
+    val vocabset = new mutable.HashSet[Int]
+    docgammas.foreach { docgamma =>
+      val termCounts = docgamma._2._1
+      val (ids: List[Int], _) = termCounts match {
+        case v: DenseVector => ((0 until v.size).toList, v.values)
+        case v: SparseVector => (v.indices.toList, v.values)
+        case v => throw new IllegalArgumentException("Online LDA does not support vector type "
+          + v.getClass)
+      }
+      vocabset ++= ids
+    }
+    val vocabs = new KeyList()
+    for (id <- vocabset.toArray.sorted) {
+      vocabs.addKey(id)
+    }
+
+    val session = new Session(m, monitorPath, index)
+    val wtm = m.getMatrix("word-topics").asInstanceOf[FloatMatrixWithIntKey]
+    val wt: mutable.HashMap[Int, Array[Float]] = wtm.fetch(vocabs, session)
+
+    val alphaVector = Vectors.dense(Array.fill(k)(alpha))
+    val brzAlpha = alphaVector.toBreeze.toDenseVector
+    var docScore = 0.0D
+    docgammas.foreach { docgamma =>
+      val (termCounts: Vector, gammad: BDV[Double]) = docgamma._2
 
       val Elogthetad: BDV[Double] = digamma(gammad) - digamma(sum(gammad))
-
       // E[log p(doc | theta, beta)]
       termCounts.foreachActive { case (idx, count) =>
-        val x = Elogthetad + Elogbeta(::, idx)
+        val topic = wt.get(idx) match {
+          case Some(topicArray) => BDV(topicArray.map(_.toDouble))
+          case None => throw new IllegalArgumentException("Convert ps word topic to matrix ")
+        }
+        val x = Elogthetad + topic
         val a = max(x)
         docScore += count * (a + log(sum(exp(x :- a))))
       }
@@ -400,18 +441,10 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
       docScore += sum((brzAlpha - gammad) :* Elogthetad)
       docScore += sum(lgamma(gammad) - lgamma(brzAlpha))
       docScore += lgamma(sum(brzAlpha)) - lgamma(sum(gammad))
+    }
+    session.disconnect()
 
-      docScore
-    }.sum()
-
-    // E[log p(beta | eta) - log q (beta | lambda)]; assumes eta is a scalar
-    val sumEta = eta * vocabSize
-    var topicScore = 0D
-    topicScore += sum((eta - lambda) :* Elogbeta)
-    topicScore += sum(lgamma(lambda) - lgamma(eta))
-    topicScore += sum(lgamma(sumEta) - lgamma(sum(lambda(::, breeze.linalg.*))))
-
-    (docScore, topicScore)
+    Iterator(docScore)
   }
 }
 
