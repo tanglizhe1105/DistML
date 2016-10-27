@@ -1,3 +1,8 @@
+# LDAExample
+Online LDA实现，数据使用RDD分布式化，模型使用参数服务器分布式化
+# HDPExample
+Online HDP实现，数据使用RDD分布式化，模型使用参数服务器分布式化
+
 # DistML (Distributed Machine Learning platform)
 
   DistML is a machine learning tool which allows traing very large models on Spark, it's fully compatible with Spark (tested on 1.2 or above).

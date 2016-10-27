@@ -28,55 +28,16 @@ import scopt.OptionParser
 import scala.collection.mutable
 import scala.reflect.runtime.universe._
 
-/**
-  * Abstract class for parameter case classes.
-  * This overrides the [[toString]] method to print all case class fields by name and value.
-  *
-  * @tparam T  Concrete parameter class.
-  */
-abstract class AbstractParams[T: TypeTag] {
 
-  private def tag: TypeTag[T] = typeTag[T]
-
-  /**
-    * Finds all case class fields in concrete class instance, and outputs them in JSON-style format:
-    * {
-    *   [field name]:\t[field value]\n
-    *   [field name]:\t[field value]\n
-    *   ...
-    * }
-    */
-  override def toString: String = {
-    val tpe = tag.tpe
-    val allAccessors = tpe.declarations.collect {
-      case m: MethodSymbol if m.isCaseAccessor => m
-    }
-    val mirror = runtimeMirror(getClass.getClassLoader)
-    val instanceMirror = mirror.reflect(this)
-    allAccessors.map { f =>
-      val paramName = f.name.toString
-      val fieldMirror = instanceMirror.reflectField(f)
-      val paramValue = fieldMirror.get
-      s"  $paramName:\t$paramValue"
-    }.mkString("{\n", ",\n", "\n}")
-  }
-}
-
-/**
-  * An example Latent Dirichlet Allocation (LDA) app. Run with
-  * {{{
-  * ./bin/run-example mllib.LDAExample [options] <input>
-  * }}}
-  * If you use it as a template to create your own app, please use `spark-submit` to submit your app.
-  */
-object LDAExample {
+object HDPExample {
 
   private case class Params(
                              psCount: Int = 2,
                              corpusSize: Int = 0,
                              windowSize: Int = 8000,
+                             K: Int = 15,
+                             T: Int = 150,
                              input: Seq[String] = Seq.empty,
-                             k: Int = 20,
                              maxIterations: Int = 10,
                              maxInnerIterations: Int = 5,
                              docConcentration: Double = 0.01,
@@ -101,9 +62,12 @@ object LDAExample {
       opt[Int]("windowSize")
         .text(s"window size. default: ${defaultParams.windowSize}")
         .action((x, c) => c.copy(windowSize = x))
-      opt[Int]("k")
-        .text(s"number of topics. default: ${defaultParams.k}")
-        .action((x, c) => c.copy(k = x))
+      opt[Int]("K")
+        .text(s"number of topics. default: ${defaultParams.K}")
+        .action((x, c) => c.copy(K = x))
+      opt[Int]("T")
+        .text(s"number of topics. default: ${defaultParams.T}")
+        .action((x, c) => c.copy(T = x))
       opt[Int]("maxIterations")
         .text(s"number of iterations of learning. default: ${defaultParams.maxIterations}")
         .action((x, c) => c.copy(maxIterations = x))
@@ -147,15 +111,6 @@ object LDAExample {
     }
   }
 
-  //    private def createOptimizer(params: Params, lineRdd: RDD[Int], columnRdd: RDD[Int]):LDAOptimizer = {
-  private def createOptimizer(params: Params): LDAOptimizer = {
-    params.optimizer match {
-      case "online" => val optimizer = new OnlineLDAOptimizer
-        optimizer
-      case _ =>
-        throw new IllegalArgumentException(s"available optimizers are em, online and gibbs, but got ${params.optimizer}")
-    }
-  }
 
   /**
     * run LDA
@@ -164,7 +119,7 @@ object LDAExample {
     */
   private def run(params: Params) {
     val conf = new SparkConf()
-      .setAppName(s"LDAExample with $params")
+      .setAppName(s"HDPExample with $params")
       .set("spark.locality.wait", "0s")
     val sc = new SparkContext(conf)
 
@@ -191,31 +146,58 @@ object LDAExample {
     println(s"[\t Preprocessing time: $preprocessElapsed sec]")
     println()
 
-    // Run LDA.
-    val lda = new LDA()
-    lda.setK(params.k)
-      .setPsCount(params.psCount)
-      .setCorpusSize(params.corpusSize)
-      .setWindowSize(params.windowSize)
-      .setPartition(params.partitions)
-      .setVocabSeze(actualVocabSize)
-      .setMaxIterations(params.maxIterations)
-      .setDocConcentration(params.docConcentration)
-      .setTopicConcentration(params.topicConcentration)
-      .setOptimizer(createOptimizer(params))
+    // Run HDP.
+    val windowSize = params.windowSize
+    val corpusSize = params.corpusSize
+    val vocabSize = actualVocabSize
+    val partition = params.partitions
+    val maxIterations = params.maxIterations
+    val psCount = params.psCount
+    val K = params.K
+    val T = params.T
 
     // set ps
-    val m = new OnlineLDAPSModel(lda.getVocabSize, lda.getK, lda.getAlpha, lda.getBeta)
-    val dm = DistML.distribute(sc, m, lda.getPsCount, DistML.defaultF)
+    val m = new OnlineHDPPSModel(vocabSize, T)
+    val dm = DistML.distribute(sc, m, psCount, DistML.defaultF)
     val monitorPath = dm.monitorPath
-    println("dataset size: " + lda.getCorpusSize)
-    dm.setTrainSetSize(lda.getCorpusSize)
+    println("dataset size: " + corpusSize)
+    dm.setTrainSetSize(corpusSize)
 
-    val startTime = System.nanoTime()
-    val ldaModel = lda.run(m, dm, monitorPath)(sc, docs)
-    val elapsed = (System.nanoTime() - startTime) / 1e9
+    // run hdp
+    val state = new OnlineHDPOptimizer(corpusSize, windowSize, vocabSize, K, T)
+    state.initPSModel(m, monitorPath)
+    var windowCount = 0
+    while ((windowCount + 1) * windowSize < corpusSize) {
+      val begin = windowCount * windowSize
+      val end = (windowCount + 1) * windowSize
+      var batch = docs.filter(x => x._1 >= begin && x._1 < end)
+      batch = batch.partitionBy(new HashPartitioner(partition))
+      batch.cache()
+      batch.count()
 
-    println(s"Finished training LDA model using ${lda.getOptimizer.getClass.getName}")
+      var iter = 0
+      val iterationTimes = Array.fill[Double](maxIterations)(0)
+      val iterationPer = Array.fill[(Double, Double)](maxIterations)((0.0D, 0.0D))
+      while (iter < maxIterations) {
+        println(s"[windowcount+iter+maxiter: $windowCount $iter $maxIterations]")
+        val start = System.nanoTime()
+        val docScore = state.next(m, monitorPath)(batch)
+        val elapsedSeconds = (System.nanoTime() - start) / 1e9
+        iterationTimes(iter) = elapsedSeconds
+
+        var topicScore = 0.0D
+        topicScore = state.topicPerplexity(m, monitorPath)
+        iterationPer(iter) = (docScore, topicScore)
+        iter += 1
+      }
+      println(s"[windowcount+itertime: $windowCount ${iterationTimes.mkString(" ")}]")
+      println(s"[windowcount+iterper: $windowCount ${iterationPer.mkString(" ")}]")
+
+      batch.unpersist()
+      windowCount += 1
+    }
+
+    println(s"Finished training HDP model using ${state.getClass.getName}")
 
     dm.recycle()
     sc.stop()

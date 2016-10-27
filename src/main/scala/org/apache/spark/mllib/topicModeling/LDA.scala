@@ -262,8 +262,9 @@ class LDA private (
       val begin = windowCount*windowSize
       val end = (windowCount +1)*windowSize
       var batch = documents.filter(x => x._1>= begin && x._1 < end)
-      batch = batch.partitionBy(new HashPartitioner(partition))
+      batch  = batch.partitionBy(new HashPartitioner(partition))
       batch.cache()
+      batch.count()
 
       var iter = 0
       val iterationTimes = Array.fill[Double](maxIterations)(0)
@@ -277,9 +278,8 @@ class LDA private (
         val elapsedSeconds = (System.nanoTime() - start) / 1e9
         iterationTimes(iter) = elapsedSeconds
 
-        val docPerplexity = state.docPerplexity(m, monitorPath, batch, gammaArray)
-        val topicPerplexity = state.topicPerplexity(m, monitorPath)
-        iterationPer(iter) = (docPerplexity, topicPerplexity)
+        val docTopicPerplexity = state.perplexity(m, monitorPath)(batch, gammaArray)
+        iterationPer(iter) = docTopicPerplexity
         iter += 1
 
         gammaArray.unpersist()

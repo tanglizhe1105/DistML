@@ -6,14 +6,14 @@ import breeze.linalg.{max, sum, DenseMatrix => BDM, DenseVector => BDV}
 import breeze.numerics._
 import breeze.stats.distributions.{Gamma, RandBasis}
 import com.intel.distml.api.{Model, Session}
-import com.intel.distml.platform.DistML
-import com.intel.distml.util.scala.FloatMatrixWithIntKey
-import com.intel.distml.util.{DataStore, KeyList}
+import com.intel.distml.util.KeyList
+import com.intel.distml.util.scala.DoubleMatrixWithIntKey
 import org.apache.spark.SparkContext
 import org.apache.spark.mllib.linalg._
 import org.apache.spark.rdd.RDD
 
 import scala.collection.mutable
+import scala.collection.mutable.ArrayBuffer
 
 /**
   * :: Experimental ::
@@ -44,7 +44,6 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
   private var corpusSize: Long = 0
   private var windowSize: Int = 0
   // model equally document size
-  private var partitionSize: Int = 0
   private var vocabSize: Int = 0
 
   /** alias for docConcentration */
@@ -163,7 +162,6 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
   def initialize(m : Model, monitorPath : String)(sc: SparkContext, lda: LDA): this.type = {
     this.corpusSize = lda.getCorpusSize
     this.windowSize = lda.getWindowSize
-    this.partitionSize = lda.getPartition
     this.vocabSize = lda.getVocabSize
     this.k = lda.getK
     this.alpha = if (lda.getDocConcentration == -1) 1.0 / k else lda.getDocConcentration
@@ -178,20 +176,20 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
     var end = start
     println("[ps model Init start: ")
     val session = new Session(m, monitorPath, 0)
-    val wtm = m.getMatrix("word-topics").asInstanceOf[FloatMatrixWithIntKey]
+    val wtm = m.getMatrix("word-topics").asInstanceOf[DoubleMatrixWithIntKey]
     val randBasis = new RandBasis(new org.apache.commons.math3.random.MersenneTwister(
       randomGenerator.nextLong()))
     val gammaRandomGenerator = new Gamma(gammaShape, 1.0 / gammaShape)(randBasis)
-    val wt = new mutable.HashMap[Int, Array[Float]]
+    val wt = new mutable.HashMap[Int, Array[Double]]
     for (i <- 0 until vocabSize) {
-      val temp = gammaRandomGenerator.sample(k).toArray.map(_.toFloat)
+      val temp = gammaRandomGenerator.sample(k).toArray
       wt.put(i, temp)
       if (i > 0 && i % 1000 == 0) {
         wtm.push(wt, session)
         wt.clear()
       }
     }
-    if (wt nonEmpty) {
+    if (wt.nonEmpty) {
       wtm.push(wt, session)
     }
     session.disconnect()
@@ -208,9 +206,7 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
   }
 
   def next(m : Model, monitorPath : String)(batch: RDD[(Long, Vector)]): RDD[(Long, BDV[Double])] = {
-    if (batch.isEmpty()) return null
     iteration += 1
-
     batch.mapPartitionsWithIndex(inference(m, monitorPath))
   }
 
@@ -242,8 +238,8 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
     var end = start
     // get word topic from ps in this partition
     val session = new Session(m, monitorPath, index)
-    val wtm = m.getMatrix("word-topics").asInstanceOf[FloatMatrixWithIntKey]
-    val wt: mutable.HashMap[Int, Array[Float]] = wtm.fetch(vocabs, session)
+    val wtm = m.getMatrix("word-topics").asInstanceOf[DoubleMatrixWithIntKey]
+    val wt: mutable.HashMap[Int, Array[Double]] = wtm.fetch(vocabs, session)
     end = System.currentTimeMillis()
     println(s"[model train fetch , partition $index time ${end - start} ms]")
     start = end
@@ -255,7 +251,7 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
         case Some(topicArray) => topicArray
         case None => throw new IllegalArgumentException("Convert ps word topic to matrix ")
       }
-      lambda(::, i) := BDV(topic.map(_.toDouble))  // fill local lambda with ps parameter
+      lambda(::, i) := BDV(topic)  // fill local lambda with ps parameter
     }
 
     // variational bayes inference
@@ -308,16 +304,17 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
 
     // compute new lambda and delta lambda
     val partitionResult = stat :* expElogbeta
-    val lambdap = partitionResult * (corpusSize.toDouble / partitionSize.toDouble) + eta
-    lambdap :-= lambda // delta lambda
+    val lambdap = partitionResult * (corpusSize.toDouble / windowSize.toDouble) + eta  // partition new lamda
+    lambda:*= (docs.size.toDouble/windowSize.toDouble)  // lamda/partitionSize
+    lambdap :-= lambda // delta lambda = patition lamda - lamda/partitionSize
     val weight = math.pow(getTau0 + iteration, -getKappa)
     lambdap :*= weight
     // push delta lambda
     for(i <- 0 until vocabs.size().toInt){
-      wt(local2globle(i)) = lambdap(::, i).toArray.map(_.toFloat)
+      wt(local2globle(i)) = lambdap(::, i).toArray
     }
     wtm.push(wt, session)
-    session.progress(partitionSize)
+    session.progress(docs.length)
     end = System.currentTimeMillis()
     println(s"[model train push , partition $index time ${end - start} ms]")
     start = end
@@ -355,8 +352,8 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
     new BDM[Double](col, row, temp).t
   }
 
-  def topicPerplexity(m : Model, monitorPath : String): Double = {
-    var topicScore = 0D
+  def perplexity(m : Model, monitorPath : String)(docs: RDD[(Long, Vector)], gammaArray: RDD[(Long, BDV[Double])]): (Double, Double) = {
+    //topic part
     var start = System.currentTimeMillis()
     var end = start
     // get word topic from ps in this partition
@@ -365,8 +362,8 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
       vocabs.addKey(id)
     }
     val session = new Session(m, monitorPath, 0)
-    val wtm = m.getMatrix("word-topics").asInstanceOf[FloatMatrixWithIntKey]
-    val wt: mutable.HashMap[Int, Array[Float]] = wtm.fetch(vocabs, session)
+    val wtm = m.getMatrix("word-topics").asInstanceOf[DoubleMatrixWithIntKey]
+    val wt: mutable.HashMap[Int, Array[Double]] = wtm.fetch(vocabs, session)
     end = System.currentTimeMillis()
     println(s"[model train fetch , partition 0 time ${end - start} ms]")
     start = end
@@ -376,12 +373,14 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
         case Some(topicArray) => topicArray
         case None => throw new IllegalArgumentException("Convert ps word topic to matrix ")
       }
-      lambda(::, i) := BDV(topic.map(_.toDouble))  // fill local lambda with ps parameter
+      lambda(::, i) := BDV(topic) // fill local lambda with ps parameter
     }
 
     val Elogbeta = OnlineLDAOptimizer.dirichletExpectation(lambda)
+    val bcElogbeta = docs.sparkContext.broadcast(Elogbeta)
 
     // E[log p(beta | eta) - log q (beta | lambda)]; assumes eta is a scalar
+    var topicScore = 0D
     val sumEta = eta * vocabSize
     topicScore += sum((eta - lambda) :* Elogbeta)
     topicScore += sum(lgamma(lambda) - lgamma(eta))
@@ -389,62 +388,36 @@ final class OnlineLDAOptimizer extends LDAOptimizer with Serializable {
 
     session.disconnect()
 
-    topicScore
-  }
 
-  def docPerplexity(m : Model, monitorPath : String, docs: RDD[(Long, Vector)], gammaArray: RDD[(Long, BDV[Double])]): Double = {
-    val docScore = docs.join(gammaArray).mapPartitionsWithIndex(docPerplexity(m, monitorPath)).sum()
-    docScore
-  }
+    //doc part
+    val docScore = docs.join(gammaArray).mapPartitions { case it: Iterator[(Long, (Vector, BDV[Double]))] =>
+      val Elogbeta = bcElogbeta.value
+      val alphaVector = Vectors.dense(Array.fill(k)(alpha))
+      val brzAlpha = alphaVector.toBreeze.toDenseVector
 
-  def docPerplexity(m : Model, monitorPath: String)(index: Int, it: Iterator[(Long, (Vector, BDV[Double]))])
-  : Iterator[Double] = {
-    val docgammas = it.toArray
-    val vocabset = new mutable.HashSet[Int]
-    docgammas.foreach { docgamma =>
-      val termCounts = docgamma._2._1
-      val (ids: List[Int], _) = termCounts match {
-        case v: DenseVector => ((0 until v.size).toList, v.values)
-        case v: SparseVector => (v.indices.toList, v.values)
-        case v => throw new IllegalArgumentException("Online LDA does not support vector type "
-          + v.getClass)
-      }
-      vocabset ++= ids
-    }
-    val vocabs = new KeyList()
-    for (id <- vocabset.toArray.sorted) {
-      vocabs.addKey(id)
-    }
-
-    val session = new Session(m, monitorPath, index)
-    val wtm = m.getMatrix("word-topics").asInstanceOf[FloatMatrixWithIntKey]
-    val wt: mutable.HashMap[Int, Array[Float]] = wtm.fetch(vocabs, session)
-
-    val alphaVector = Vectors.dense(Array.fill(k)(alpha))
-    val brzAlpha = alphaVector.toBreeze.toDenseVector
-    var docScore = 0.0D
-    docgammas.foreach { docgamma =>
-      val (termCounts: Vector, gammad: BDV[Double]) = docgamma._2
-
-      val Elogthetad: BDV[Double] = digamma(gammad) - digamma(sum(gammad))
-      // E[log p(doc | theta, beta)]
-      termCounts.foreachActive { case (idx, count) =>
-        val topic = wt.get(idx) match {
-          case Some(topicArray) => BDV(topicArray.map(_.toDouble))
-          case None => throw new IllegalArgumentException("Convert ps word topic to matrix ")
+      val docScores = new ArrayBuffer[Double]()
+      it.foreach { ixdDocGamma =>
+        val (termCounts: Vector, gammad: BDV[Double]) = ixdDocGamma._2
+        var docScore = 0.0D
+        val Elogthetad: BDV[Double] = digamma(gammad) - digamma(sum(gammad))
+        // E[log p(doc | theta, beta)]
+        termCounts.foreachActive { case (idx, count) =>
+          val x = Elogthetad + Elogbeta(::, idx)
+          val a = max(x)
+          docScore += count * (a + log(sum(exp(x :- a))))
         }
-        val x = Elogthetad + topic
-        val a = max(x)
-        docScore += count * (a + log(sum(exp(x :- a))))
-      }
-      // E[log p(theta | alpha) - log q(theta | gamma)]; assumes alpha is a vector
-      docScore += sum((brzAlpha - gammad) :* Elogthetad)
-      docScore += sum(lgamma(gammad) - lgamma(brzAlpha))
-      docScore += lgamma(sum(brzAlpha)) - lgamma(sum(gammad))
-    }
-    session.disconnect()
+        // E[log p(theta | alpha) - log q(theta | gamma)]; assumes alpha is a vector
+        docScore += sum((brzAlpha - gammad) :* Elogthetad)
+        docScore += sum(lgamma(gammad) - lgamma(brzAlpha))
+        docScore += lgamma(sum(brzAlpha)) - lgamma(sum(gammad))
 
-    Iterator(docScore)
+        docScores.append(docScore)
+      }
+      docScores.iterator
+    }.sum()
+    bcElogbeta.unpersist()
+
+    (docScore, topicScore)
   }
 }
 
